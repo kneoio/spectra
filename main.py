@@ -14,6 +14,7 @@ essentia.log.infoActive = False
 essentia.log.warningActive = False
 
 from check_metadata import scan_file as scan_metadata_for_ai_tags
+from models_setup import ensure_models
 
 MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 
@@ -125,6 +126,9 @@ def analyze(path: str) -> dict:
 
 
 def main():
+    ensure_models()
+
+
     try:
         result = analyze(AUDIO_FILE)
     except RuntimeError as e:
