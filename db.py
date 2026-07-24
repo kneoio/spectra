@@ -16,13 +16,39 @@ DB_PASSWORD = os.environ.get("SPECTRA_DB_PASSWORD")
 
 SF_TABLE = "mixpla__sound_fragments"
 
+# _files.file_type: 101 = original SOUND_FRAGMENT, 102 = OPUS_ENCODED, 0 = legacy
+# original (pre-typing). We must analyze the ORIGINAL, never the opus encode.
+OPUS_FILE_TYPE = 102
+
+
+def _connect():
+    return psycopg2.connect(
+        host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD
+    )
+
+
+def get_original_file_key(sound_fragment_id: str) -> str | None:
+    """Resolve the original (non-opus) Hetzner file_key for a SoundFragment from
+    _files. Excludes opus encodes; prefers file_type 101 over legacy 0."""
+    conn = _connect()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT file_key FROM _files "
+                "WHERE parent_id = %s AND archived = 0 AND file_type <> %s "
+                "ORDER BY file_type DESC LIMIT 1",
+                (sound_fragment_id, OPUS_FILE_TYPE),
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
+    finally:
+        conn.close()
+
 
 def save_analysis(sound_fragment_id: str, metadata: dict) -> int:
     """Write the analysis result into the SoundFragment's `add_info` jsonb column.
     Returns the number of rows updated (0 if the id doesn't exist)."""
-    conn = psycopg2.connect(
-        host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD
-    )
+    conn = _connect()
     try:
         with conn, conn.cursor() as cur:
             cur.execute(
