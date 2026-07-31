@@ -142,3 +142,19 @@ def analyze(path: str) -> dict:
     }
 
     return result
+
+
+def is_music(result: dict) -> bool:
+    """Heuristic music-vs-speech verdict for pre-save gating.
+
+    Uses Discogs top genre: labels under Non-Music---* (Spoken Word, Dialogue, …)
+    mean the file is not a song. Tiny clips (<3s) are rejected as incomplete.
+    """
+    duration = float(result.get("duration_sec") or 0)
+    if duration < 3.0:
+        return False
+    top = result.get("top_genres") or []
+    if not top:
+        return True
+    genre = (top[0].get("genre") or "") if isinstance(top[0], dict) else ""
+    return not str(genre).startswith("Non-Music---")

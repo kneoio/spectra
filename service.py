@@ -1,11 +1,13 @@
 import logging
 import os
+import tempfile
 from contextlib import asynccontextmanager
 
-from fastapi import BackgroundTasks, FastAPI
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
-from analysis import analyze, get_model_bundle
+from analysis import analyze, get_model_bundle, is_music
 from db import get_original_file_key, save_analysis
 from models_setup import ensure_models
 from storage import download_to_temp
@@ -33,6 +35,40 @@ app = FastAPI(title="Spectra", lifespan=lifespan)
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/assess")
+async def assess_track(file: UploadFile = File(...)) -> dict:
+    """Synchronous pre-save assessment: upload a local audio file, get analysis
+    back in the response (including is_music). Writes nothing to the database —
+    used by jesoos chat (assess_track / upload_song) before a SoundFragment exists.
+    """
+    suffix = os.path.splitext(file.filename or "")[1] or ".bin"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+        result = await run_in_threadpool(analyze, tmp_path)
+        result.pop("file", None)
+        if "duration_sec" in result:
+            result["duration_seconds"] = result["duration_sec"]
+        result["is_music"] = is_music(result)
+        logger.info(
+            "Assessed %s is_music=%s duration=%s bpm=%s",
+            file.filename, result["is_music"], result.get("duration_sec"), result.get("bpm"),
+        )
+        return result
+    except Exception as e:
+        logger.exception("Assess failed for %s", file.filename)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 def _resolve_file(sound_fragment_id: str, path: str | None) -> tuple[str, bool]:
