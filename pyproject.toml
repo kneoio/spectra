@@ -13,3 +13,21 @@ dependencies = [
     "boto3>=1.35.0",
     "psycopg2-binary>=2.9.0",
 ]
+
+[project.optional-dependencies]
+# PANNs event-timeline POC (independent of Essentia).
+# Install with: uv sync --extra panns
+# Uses the vendored panns_support stack (torch only). Upstream
+# panns-inference is optional if you want it instead.
+panns = [
+    "torch",
+]
+
+# Prefer CPU wheels for a lighter POC install (override if you have CUDA).
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
