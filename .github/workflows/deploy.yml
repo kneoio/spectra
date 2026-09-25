@@ -1,4 +1,4 @@
-name: Build and Push
+name: Build and Deploy
 
 on:
   workflow_dispatch:
@@ -41,3 +41,16 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Deploy to remote server
+        if: success()
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd /home/mixpla/compose
+            docker compose pull spectra
+            docker compose up -d spectra
+            docker image prune -f
