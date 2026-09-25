@@ -144,6 +144,89 @@ def analyze(path: str) -> dict:
     return result
 
 
+SPECTRAL_MAP_SR = 44100
+SPECTRAL_MAP_FRAME_SIZE = 2048
+SPECTRAL_MAP_HOP_SIZE = 1024
+LOW_ONSET_CUTOFF_HZ = 250.0
+
+# (low_hz, high_hz) per band, covering 0..sr/2.
+BAND_RANGES = {
+    "sub": (20, 60),
+    "bass": (60, 150),
+    "low_mid": (150, 400),
+    "mid": (400, 2000),
+    "high_mid": (2000, 4000),
+    "presence": (4000, 6000),
+    "air": (6000, SPECTRAL_MAP_SR / 2),
+}
+
+
+def _segment_audio(audio: np.ndarray, segment: str, seconds: float, sr: int) -> np.ndarray:
+    n = len(audio)
+    seg_len = min(int(seconds * sr), n)
+    if segment == "tail":
+        return audio[n - seg_len:]
+    if segment == "head":
+        return audio[:seg_len]
+    raise ValueError(f"segment must be 'tail' or 'head', got {segment!r}")
+
+
+def spectral_map(path: str, segment: str, seconds: float) -> dict:
+    """Band-energy + rhythm time series for the given edge (head/tail) of a
+    track, in the schema coincidense.mixer.Track expects: per-frame band
+    levels_db and rms_db, detected beats, low-band onsets, plus bpm/key/scale.
+    All times (times/beats/low_onsets) are relative to the extracted segment,
+    starting at 0."""
+    sr = SPECTRAL_MAP_SR
+    audio = es.MonoLoader(filename=path, sampleRate=sr)()
+    seg = _segment_audio(audio, segment, seconds, sr)
+    if len(seg) < SPECTRAL_MAP_FRAME_SIZE:
+        raise ValueError(f"segment too short for analysis: {len(seg)} samples at sr={sr}")
+
+    hop_sec = SPECTRAL_MAP_HOP_SIZE / sr
+    windowing = es.Windowing(type="hann")
+    spectrum = es.Spectrum()
+    rms = es.RMS()
+
+    n_bins = SPECTRAL_MAP_FRAME_SIZE // 2 + 1
+    freqs = np.linspace(0, sr / 2, n_bins)
+    band_bins = {name: np.where((freqs >= lo) & (freqs < hi))[0] for name, (lo, hi) in BAND_RANGES.items()}
+
+    times, rms_db = [], []
+    levels_db = {name: [] for name in BAND_RANGES}
+    for i, frame in enumerate(es.FrameGenerator(seg, frameSize=SPECTRAL_MAP_FRAME_SIZE,
+                                                 hopSize=SPECTRAL_MAP_HOP_SIZE, startFromZero=True)):
+        spec = spectrum(windowing(frame))
+        times.append(i * hop_sec)
+        rms_db.append(20 * np.log10(rms(frame) + 1e-12))
+        for name, bins in band_bins.items():
+            energy = float(np.sum(spec[bins] ** 2)) if len(bins) else 0.0
+            levels_db[name].append(10 * np.log10(energy + 1e-12))
+
+    bpm, beats, beats_confidence, _, _ = es.RhythmExtractor2013(method="multifeature")(seg)
+
+    lowpass = es.LowPass(cutoffFrequency=LOW_ONSET_CUTOFF_HZ, sampleRate=sr)
+    low_onsets, _ = es.OnsetRate()(lowpass(seg))
+
+    key, scale, key_strength = es.KeyExtractor()(seg)
+
+    return {
+        "segment": segment,
+        "hop_sec": round(hop_sec, 6),
+        "times": [round(t, 4) for t in times],
+        "bands": [{"name": name} for name in BAND_RANGES],
+        "levels_db": {name: [round(v, 2) for v in vals] for name, vals in levels_db.items()},
+        "rms_db": [round(v, 2) for v in rms_db],
+        "beats": [round(float(b), 4) for b in beats],
+        "beats_confidence": round(float(beats_confidence), 3),
+        "low_onsets": [round(float(o), 4) for o in low_onsets],
+        "bpm": round(float(bpm), 2),
+        "key": key,
+        "scale": scale,
+        "key_strength": round(float(key_strength), 3),
+    }
+
+
 def is_music(result: dict) -> bool:
     """Heuristic music-vs-speech verdict for pre-save gating.
 

@@ -1,16 +1,23 @@
+import json
 import logging
 import os
 import tempfile
 from contextlib import asynccontextmanager
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from coincidense.mixer import plan_mix
+from coincidense.render import render as render_mix
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
-from analysis import analyze, get_model_bundle, is_music
+from analysis import analyze, get_model_bundle, is_music, spectral_map
 from db import get_original_file_key, save_analysis
 from models_setup import ensure_models
 from storage import download_to_temp
+
+DEFAULT_MIX_SECONDS = 30.0
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("spectra.service")
@@ -69,6 +76,93 @@ async def assess_track(file: UploadFile = File(...)) -> dict:
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+@app.post("/spectral-map")
+async def spectral_map_track(
+    file: UploadFile = File(...),
+    segment: str = Form(...),
+    seconds: float = Form(30.0),
+) -> dict:
+    """Band-energy/rhythm time series for one edge (head/tail) of an uploaded
+    track — used by coincidense to plan a beat-aligned crossfade. Writes
+    nothing to the database."""
+    suffix = os.path.splitext(file.filename or "")[1] or ".bin"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+        return await run_in_threadpool(spectral_map, tmp_path, segment, seconds)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        logger.exception("Spectral map failed for %s", file.filename)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+async def _save_upload(file: UploadFile) -> str:
+    suffix = os.path.splitext(file.filename or "")[1] or ".bin"
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    with open(tmp_path, "wb") as out:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+    return tmp_path
+
+
+def _cleanup(*paths: str | None) -> None:
+    for path in paths:
+        if path and os.path.exists(path):
+            os.remove(path)
+
+
+@app.post("/mix")
+async def mix_tracks(
+    file_a: UploadFile = File(..., description="outgoing track (tail is analyzed)"),
+    file_c: UploadFile = File(..., description="incoming track (head is analyzed)"),
+    seconds: float = Form(DEFAULT_MIX_SECONDS),
+    keylock: bool = Form(True),
+) -> FileResponse:
+    """Analyze A's tail and C's head, plan a beat-aligned crossfade
+    (coincidense.mixer.plan_mix), render it (coincidense.render.render), and
+    return the mixed WAV. The plan itself comes back as the X-Mix-Plan header."""
+    tmp_a = tmp_c = tmp_out = None
+    try:
+        tmp_a = await _save_upload(file_a)
+        tmp_c = await _save_upload(file_c)
+        map_a = await run_in_threadpool(spectral_map, tmp_a, "tail", seconds)
+        map_c = await run_in_threadpool(spectral_map, tmp_c, "head", seconds)
+        plan = await run_in_threadpool(plan_mix, map_a, map_c)
+
+        fd, tmp_out = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        await run_in_threadpool(render_mix, plan, tmp_a, tmp_c, tmp_out, keylock)
+
+        return FileResponse(
+            tmp_out,
+            media_type="audio/wav",
+            filename="mix.wav",
+            headers={"X-Mix-Plan": json.dumps(plan)},
+            background=BackgroundTask(_cleanup, tmp_a, tmp_c, tmp_out),
+        )
+    except (ValueError, RuntimeError) as e:
+        _cleanup(tmp_a, tmp_c, tmp_out)
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        logger.exception("Mix failed for %s / %s", file_a.filename, file_c.filename)
+        _cleanup(tmp_a, tmp_c, tmp_out)
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 def _resolve_file(sound_fragment_id: str, path: str | None) -> tuple[str, bool]:
