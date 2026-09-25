@@ -1,5 +1,7 @@
 import json
 import os
+import subprocess
+import tempfile
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
@@ -13,6 +15,32 @@ essentia.log.warningActive = False
 from check_metadata import scan_file as scan_metadata_for_ai_tags
 
 MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+FFMPEG_PATH = os.environ.get("FFMPEG_PATH", "ffmpeg")
+
+
+def _transcode_to_wav(path: str) -> str:
+    fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    subprocess.run(
+        [FFMPEG_PATH, "-y", "-i", path, wav_path],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return wav_path
+
+
+def _load_mono(path: str, sample_rate: int | None = None) -> tuple[np.ndarray, int]:
+    """Load mono audio via a normalized WAV, always transcoded through system
+    ffmpeg first. Essentia's bundled decoder can't handle some codecs (e.g.
+    Opus) — and a MonoLoader that fails to configure corrupts memory in its
+    own cleanup path rather than just raising, so it must never even be
+    constructed against a file it might not decode."""
+    wav_path = _transcode_to_wav(path)
+    try:
+        kwargs = {"sampleRate": sample_rate} if sample_rate else {}
+        loader = es.MonoLoader(filename=wav_path, **kwargs)
+        return loader(), int(loader.paramValue("sampleRate"))
+    finally:
+        os.remove(wav_path)
 
 EMBEDDING_MODEL = os.path.join(MODELS_DIR, "discogs-effnet-bs64-1.pb")
 GENRE_MODEL = os.path.join(MODELS_DIR, "genre_discogs400-discogs-effnet-1.pb")
@@ -77,7 +105,7 @@ def get_model_bundle() -> ModelBundle:
 
 def classify_genre_mood(path: str, models: ModelBundle) -> dict:
     # Discogs-EffNet embedding model expects mono 16kHz audio.
-    audio_16k = es.MonoLoader(filename=path, sampleRate=16000)()
+    audio_16k, _ = _load_mono(path, sample_rate=16000)
     embeddings = models.embedding_model(audio_16k)
 
     genre_scores = np.mean(models.genre_model(embeddings), axis=0)
@@ -105,10 +133,9 @@ def classify_genre_mood(path: str, models: ModelBundle) -> dict:
 
 def analyze(path: str) -> dict:
     models = get_model_bundle()
-    loader = es.MonoLoader(filename=path)
-    audio = loader()
+    audio, sample_rate = _load_mono(path)
 
-    duration = len(audio) / loader.paramValue("sampleRate")
+    duration = len(audio) / sample_rate
 
     rhythm_extractor = es.RhythmExtractor2013(method="multifeature")
     bpm, beats, beats_confidence, _, beats_intervals = rhythm_extractor(audio)
@@ -178,7 +205,7 @@ def spectral_map(path: str, segment: str, seconds: float) -> dict:
     All times (times/beats/low_onsets) are relative to the extracted segment,
     starting at 0."""
     sr = SPECTRAL_MAP_SR
-    audio = es.MonoLoader(filename=path, sampleRate=sr)()
+    audio, _ = _load_mono(path, sample_rate=sr)
     seg = _segment_audio(audio, segment, seconds, sr)
     if len(seg) < SPECTRAL_MAP_FRAME_SIZE:
         raise ValueError(f"segment too short for analysis: {len(seg)} samples at sr={sr}")
