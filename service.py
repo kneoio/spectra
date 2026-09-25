@@ -4,8 +4,8 @@ import os
 import tempfile
 from contextlib import asynccontextmanager
 
-from coincidense.mixer import plan_mix
-from coincidense.render import render as render_mix
+from mixer import plan_mix
+from render import render as render_mix
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -85,7 +85,7 @@ async def spectral_map_track(
     seconds: float = Form(30.0),
 ) -> dict:
     """Band-energy/rhythm time series for one edge (head/tail) of an uploaded
-    track — used by coincidense to plan a beat-aligned crossfade. Writes
+    track — used by mixer.plan_mix to plan a beat-aligned crossfade. Writes
     nothing to the database."""
     suffix = os.path.splitext(file.filename or "")[1] or ".bin"
     tmp_path = None
@@ -135,8 +135,8 @@ async def mix_tracks(
     keylock: bool = Form(True),
 ) -> FileResponse:
     """Analyze A's tail and C's head, plan a beat-aligned crossfade
-    (coincidense.mixer.plan_mix), render it (coincidense.render.render), and
-    return the mixed WAV. The plan itself comes back as the X-Mix-Plan header."""
+    (mixer.plan_mix), render it (render.render), and return the mixed WAV.
+    The plan itself comes back as the X-Mix-Plan header."""
     tmp_a = tmp_c = tmp_out = None
     try:
         tmp_a = await _save_upload(file_a)

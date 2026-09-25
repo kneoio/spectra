@@ -1,9 +1,10 @@
 FROM python:3.14-slim
 
 # ffmpeg supplies the `ffprobe` binary used by the AI-metadata scan, plus audio
-# codecs; curl is used by ensure_models() as the model-download fallback.
+# codecs; curl is used by ensure_models() as the model-download fallback;
+# rubberband-cli backs render.py's keylock time-stretch.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg curl ca-certificates \
+        ffmpeg curl ca-certificates rubberband-cli \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
