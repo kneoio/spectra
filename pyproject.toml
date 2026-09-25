@@ -32,4 +32,4 @@ explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
-coincidense = { path = "../coincidense", editable = true }
+coincidense = { git = "https://github.com/kneoio/coincidense.git", rev = "d8334fd838424458876e1410d08821e2a4a5e183" }
