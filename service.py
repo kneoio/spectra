@@ -164,6 +164,24 @@ def _cleanup(*paths: str | None) -> None:
             os.remove(path)
 
 
+def _absolutize_plan(plan: dict, a_offset_sec: float) -> dict:
+    """plan_mix's A-side times are relative to A's analyzed tail segment
+    (which starts partway into the full file), while render() and any UI
+    waveform highlight need absolute positions in A's original file. C's
+    head segment always starts at file position 0, so C-side times need no
+    correction. A no-op when a_offset_sec is 0 (e.g. seconds >= A's duration)."""
+    if not a_offset_sec:
+        return plan
+    plan["a"]["mix_start_sec"] = round(plan["a"]["mix_start_sec"] + a_offset_sec, 3)
+    plan["a"]["stop_sec"] = round(plan["a"]["stop_sec"] + a_offset_sec, 3)
+    for band in plan["automation"].values():
+        for keyframe in band:
+            keyframe["a_time"] = round(keyframe["a_time"] + a_offset_sec, 3)
+    for alt in plan["alternatives"]:
+        alt["a_mix_start_sec"] = round(alt["a_mix_start_sec"] + a_offset_sec, 3)
+    return plan
+
+
 @app.post("/mix")
 async def mix_tracks(
     file_a: UploadFile = File(..., description="outgoing track (tail is analyzed)"),
@@ -181,6 +199,7 @@ async def mix_tracks(
         map_a = await run_in_threadpool(spectral_map, tmp_a, "tail", seconds)
         map_c = await run_in_threadpool(spectral_map, tmp_c, "head", seconds)
         plan = await run_in_threadpool(plan_mix, map_a, map_c)
+        plan = _absolutize_plan(plan, map_a["segment_offset_sec"])
 
         fd, tmp_out = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
@@ -218,6 +237,7 @@ async def _run_mix_job(job: MixJob, job_id: str, tmp_a: str, tmp_c: str, seconds
         map_c = await run_in_threadpool(spectral_map, tmp_c, "head", seconds)
         await _emit(job, job_id, "Planning the crossfade", "PROCESSING")
         plan = await run_in_threadpool(plan_mix, map_a, map_c)
+        plan = _absolutize_plan(plan, map_a["segment_offset_sec"])
         job.plan = plan
         await _emit(job, job_id, "Rendering the mix", "PROCESSING")
         fd, tmp_out = tempfile.mkstemp(suffix=".wav")

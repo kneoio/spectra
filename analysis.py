@@ -200,15 +200,18 @@ def _segment_audio(audio: np.ndarray, segment: str, seconds: float, sr: int) -> 
 
 def spectral_map(path: str, segment: str, seconds: float) -> dict:
     """Band-energy + rhythm time series for the given edge (head/tail) of a
-    track, in the schema coincidense.mixer.Track expects: per-frame band
-    levels_db and rms_db, detected beats, low-band onsets, plus bpm/key/scale.
-    All times (times/beats/low_onsets) are relative to the extracted segment,
-    starting at 0."""
+    track, in the schema mixer.Track expects: per-frame band levels_db and
+    rms_db, detected beats, low-band onsets, plus bpm/key/scale. All times
+    (times/beats/low_onsets) are relative to the extracted segment, starting
+    at 0 — segment_offset_sec is where that segment sits in the full file
+    (0 for 'head'; full_duration - seconds for 'tail'), needed to convert a
+    mix plan's times back to absolute positions in the original file."""
     sr = SPECTRAL_MAP_SR
     audio, _ = _load_mono(path, sample_rate=sr)
     seg = _segment_audio(audio, segment, seconds, sr)
     if len(seg) < SPECTRAL_MAP_FRAME_SIZE:
         raise ValueError(f"segment too short for analysis: {len(seg)} samples at sr={sr}")
+    segment_offset_sec = (len(audio) - len(seg)) / sr if segment == "tail" else 0.0
 
     hop_sec = SPECTRAL_MAP_HOP_SIZE / sr
     windowing = es.Windowing(type="hann")
@@ -239,6 +242,7 @@ def spectral_map(path: str, segment: str, seconds: float) -> dict:
 
     return {
         "segment": segment,
+        "segment_offset_sec": round(segment_offset_sec, 4),
         "hop_sec": round(hop_sec, 6),
         "times": [round(t, 4) for t in times],
         "bands": [{"name": name} for name in BAND_RANGES],
