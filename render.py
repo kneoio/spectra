@@ -201,7 +201,8 @@ def mix_audio(plan: dict, path_a: str, path_c: str, keylock: bool = True) -> np.
 
     c_audio = load_audio(path_c, sr)
     c_out = build_c_output(c_audio, sr, plan, keylock)
-    c_mixed = _shaped(c_out, automation, "c_db", sr, t0=0.0)
+    c_gain = 10 ** (float(plan["c"].get("gain_db", 0.0)) / 20)
+    c_mixed = _shaped(c_out, automation, "c_db", sr, t0=0.0) * c_gain
 
     c_start_sample = int(round(plan["a"]["mix_start_sec"] * sr))
     total_len = max(len(a_mixed), c_start_sample + len(c_mixed))
