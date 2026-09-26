@@ -14,6 +14,8 @@ import soundfile as sf
 from scipy import signal
 
 RENDER_SR = 44100
+OPUS_SR = 48000
+OUTPUT_FORMATS = ("opus", "wav")
 LOW_CUTOFF_HZ = 250.0
 HIGH_CUTOFF_HZ = 2000.0
 RECON_ERROR_DB_MAX = -60.0
@@ -186,7 +188,8 @@ def build_c_output(c_audio: np.ndarray, sr: int, plan: dict, keylock: bool) -> n
     return warp(c_from_start, sr, segments)
 
 
-def render(plan: dict, path_a: str, path_c: str, out_path: str, keylock: bool = True) -> None:
+def mix_audio(plan: dict, path_a: str, path_c: str, keylock: bool = True) -> np.ndarray:
+    """The mixed A->C audio (stereo, RENDER_SR), before peak normalization."""
     if keylock:
         check_rubberband()
 
@@ -205,13 +208,26 @@ def render(plan: dict, path_a: str, path_c: str, out_path: str, keylock: bool = 
     mix = np.zeros((total_len, 2), dtype=np.float64)
     mix[:len(a_mixed)] += a_mixed
     mix[c_start_sample:c_start_sample + len(c_mixed)] += c_mixed
+    return mix
 
+
+def write_audio(mix: np.ndarray, out_path: str, fmt: str = "wav", sr: int = RENDER_SR) -> None:
+    """Peak-limit `mix` to PEAK_TARGET_DBFS and write it as 24-bit WAV or Ogg
+    Opus (resampled to OPUS_SR, which Opus requires)."""
+    if fmt not in OUTPUT_FORMATS:
+        raise ValueError(f"unsupported format {fmt!r}; use one of {', '.join(OUTPUT_FORMATS)}")
     peak = float(np.max(np.abs(mix))) if mix.size else 0.0
     target_peak = 10 ** (PEAK_TARGET_DBFS / 20)
     if peak > target_peak:
-        mix *= target_peak / peak
+        mix = mix * (target_peak / peak)
+    if fmt == "opus":
+        sf.write(out_path, _resample(mix, sr, OPUS_SR), OPUS_SR, format="OGG", subtype="OPUS")
+    else:
+        sf.write(out_path, mix, sr, subtype="PCM_24")
 
-    sf.write(out_path, mix, sr, subtype="PCM_24")
+
+def render(plan: dict, path_a: str, path_c: str, out_path: str, keylock: bool = True, fmt: str = "wav") -> None:
+    write_audio(mix_audio(plan, path_a, path_c, keylock), out_path, fmt)
 
 
 def main() -> None:
