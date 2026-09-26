@@ -10,14 +10,15 @@ from dataclasses import dataclass, field
 
 from chain import HEAD_SEC, TAIL_SEC, render_chain
 from mixer import GRID_SOURCES, plan_mix
-from render import OUTPUT_FORMATS, render as render_mix
+from render import BANDS, OUTPUT_FORMATS, render as render_mix
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
-from analysis import analyze, get_model_bundle, is_music, spectral_map
+from analysis import analyze, get_model_bundle, is_music, spectral_map, vocal_segments
+from transition import transition_report
 from db import get_original_file_key, save_analysis
 from models_setup import ensure_models
 from storage import download_to_temp
@@ -29,6 +30,8 @@ MIX_JOB_TTL_SECONDS = 1800
 MIX_JOB_REAP_INTERVAL_SECONDS = 300
 DEFAULT_MIX_GRID = "beats"
 SSE_KEEPALIVE_SECONDS = 15
+MIX_ANALYSIS_TTL_SECONDS = 1800
+MAX_PLAN_RATE_SHIFT = 0.5
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("spectra.service")
@@ -54,7 +57,20 @@ class MixJob:
     error: str | None = None
 
 
+@dataclass
+class MixAnalysis:
+    """Uploads and spectral maps kept by /mix/analyze so /mix and /mix/jobs can
+    render from an analysis_id without re-uploading or re-analyzing."""
+    path_a: str
+    path_c: str
+    map_a: dict
+    map_c: dict
+    grid: str
+    last_used: float = field(default_factory=time.monotonic)
+
+
 _mix_jobs: dict[str, MixJob] = {}
+_mix_analyses: dict[str, MixAnalysis] = {}
 _mix_tasks: set[asyncio.Task] = set()  # strong refs so running jobs aren't garbage-collected
 
 
@@ -70,6 +86,12 @@ async def _reap_mix_jobs() -> None:
             job = _mix_jobs.pop(job_id, None)
             if job:
                 _cleanup(job.result_path)
+        cutoff = time.monotonic() - MIX_ANALYSIS_TTL_SECONDS
+        stale = [aid for aid, an in _mix_analyses.items() if an.last_used < cutoff]
+        for aid in stale:
+            an = _mix_analyses.pop(aid, None)
+            if an:
+                _cleanup(an.path_a, an.path_c)
 
 
 @asynccontextmanager
@@ -181,6 +203,11 @@ def _present(uploads: list[UploadFile] | None) -> list[UploadFile]:
     return [u for u in uploads or [] if u.filename]
 
 
+def _upload(upload: UploadFile | None) -> UploadFile | None:
+    """The upload if it actually carries a file, else None."""
+    return upload if upload and upload.filename else None
+
+
 def _cleanup(*paths: str | None) -> None:
     for path in paths:
         if path and os.path.exists(path):
@@ -205,56 +232,165 @@ def _absolutize_plan(plan: dict, a_offset_sec: float) -> dict:
     return plan
 
 
+def _check_plan(plan_json: str) -> dict:
+    """A user-edited plan (same shape as plan_mix output, absolute A times),
+    checked for what render needs: A's mix start/stop, C's start, a tempo curve
+    and low/mid/high automation with non-decreasing times."""
+    try:
+        plan = json.loads(plan_json)
+        a_start, a_stop = float(plan["a"]["mix_start_sec"]), float(plan["a"]["stop_sec"])
+        c_start = float(plan["c"]["start_from_sec"])
+        float(plan["c"].get("gain_db", 0.0))
+        tempo = plan["tempo"]
+        automation = plan["automation"]
+    except (ValueError, TypeError, KeyError) as e:
+        raise ValueError(f"invalid plan: {e}") from e
+    if not 0 <= a_start < a_stop:
+        raise ValueError("invalid plan: need 0 <= a.mix_start_sec < a.stop_sec")
+    if c_start < 0:
+        raise ValueError("invalid plan: c.start_from_sec must be >= 0")
+    if not tempo or any(abs(float(p["rate"]) - 1) > MAX_PLAN_RATE_SHIFT for p in tempo):
+        raise ValueError(f"invalid plan: tempo needs points with rate within 1 +/- {MAX_PLAN_RATE_SHIFT}")
+    if any(float(p1["c_time"]) < float(p0["c_time"]) for p0, p1 in zip(tempo, tempo[1:])):
+        raise ValueError("invalid plan: tempo c_time must be non-decreasing")
+    for band in BANDS:
+        points = automation.get(band)
+        if not points:
+            raise ValueError(f"invalid plan: automation.{band} is missing")
+        for p in points:
+            float(p["t"]), float(p["a_db"]), float(p["c_db"])
+        if any(float(p1["t"]) < float(p0["t"]) for p0, p1 in zip(points, points[1:])):
+            raise ValueError(f"invalid plan: automation.{band} t must be non-decreasing")
+    return plan
+
+
+def _get_analysis(analysis_id: str) -> MixAnalysis:
+    analysis = _mix_analyses.get(analysis_id)
+    if analysis is None:
+        raise HTTPException(status_code=404, detail="analysis not found or expired")
+    analysis.last_used = time.monotonic()
+    return analysis
+
+
+async def _mix_sources(file_a: UploadFile | None, file_c: UploadFile | None,
+                       analysis: MixAnalysis | None) -> tuple[str, str, list[str]]:
+    """(path_a, path_c, owned): the analysis's stored files, or the uploads saved
+    to temp files. `owned` lists the temp files the caller must delete."""
+    if analysis:
+        if file_a or file_c:
+            raise ValueError("send either analysis_id or file_a/file_c, not both")
+        return analysis.path_a, analysis.path_c, []
+    if not (file_a and file_c):
+        raise ValueError("file_a and file_c are required without analysis_id")
+    path_a = await _save_upload(file_a)
+    path_c = await _save_upload(file_c)
+    return path_a, path_c, [path_a, path_c]
+
+
+def _plan_for(path_a: str, path_c: str, analysis: MixAnalysis | None, plan: dict | None,
+              seconds: float, grid: str) -> dict:
+    """The plan to render: the user's plan as given, else plan_mix on the
+    analysis's maps, else plan_mix on fresh maps of the two files."""
+    if plan is not None:
+        return plan
+    if analysis:
+        map_a, map_c = analysis.map_a, analysis.map_c
+    else:
+        map_a = spectral_map(path_a, "tail", seconds)
+        map_c = spectral_map(path_c, "head", seconds)
+    return _absolutize_plan(plan_mix(map_a, map_c, grid), map_a["segment_offset_sec"])
+
+
+@app.post("/mix/analyze")
+async def analyze_mix(
+    file_a: UploadFile = File(..., description="outgoing track (tail is analyzed)"),
+    file_c: UploadFile = File(..., description="incoming track (head is analyzed)"),
+    seconds: float = Form(DEFAULT_MIX_SECONDS),
+    grid: str = Form(DEFAULT_MIX_GRID, description="beat-grid phase source: beats or kicks"),
+) -> dict:
+    """Transition report for the interactive mixer: per-bar band levels, beats,
+    kicks, vocals and edge shape of A's tail and C's head, their compatibility,
+    and the automatic plan as a starting point. The uploads and maps are kept
+    for MIX_ANALYSIS_TTL_SECONDS under analysis_id, which /mix and /mix/jobs
+    accept (optionally with an edited plan) instead of the files."""
+    path_a = path_c = None
+    try:
+        _check_grid(grid)
+        path_a = await _save_upload(file_a)
+        path_c = await _save_upload(file_c)
+        map_a = await run_in_threadpool(spectral_map, path_a, "tail", seconds)
+        map_c = await run_in_threadpool(spectral_map, path_c, "head", seconds)
+        vocals_a = await run_in_threadpool(vocal_segments, path_a, "tail", seconds)
+        vocals_c = await run_in_threadpool(vocal_segments, path_c, "head", seconds)
+        report = transition_report(map_a, map_c, vocals_a, vocals_c, grid)
+        plan = _absolutize_plan(plan_mix(map_a, map_c, grid), map_a["segment_offset_sec"])
+    except ValueError as e:
+        _cleanup(path_a, path_c)
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        logger.exception("Mix analysis failed for %s / %s", file_a.filename, file_c.filename)
+        _cleanup(path_a, path_c)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    analysis_id = uuid.uuid4().hex
+    _mix_analyses[analysis_id] = MixAnalysis(path_a, path_c, map_a, map_c, grid)
+    return {"analysis_id": analysis_id, "expires_in_sec": MIX_ANALYSIS_TTL_SECONDS,
+            **report, "suggested_plan": plan}
+
+
 @app.post("/mix")
 async def mix_tracks(
-    file_a: UploadFile = File(..., description="outgoing track (tail is analyzed unless files_b is given)"),
-    file_c: UploadFile = File(..., description="incoming track (head is analyzed unless files_b is given)"),
+    file_a: UploadFile | None = File(None, description="outgoing track (tail is analyzed unless files_b is given); omit with analysis_id"),
+    file_c: UploadFile | None = File(None, description="incoming track (head is analyzed unless files_b is given); omit with analysis_id"),
     files_b: list[UploadFile] | None = File(None, description="optional effect/voice tracks between A and C, in play order (not analyzed)"),
+    analysis_id: str | None = Form(None, description="use the files (and maps) of a /mix/analyze result"),
+    plan: str | None = Form(None, description="JSON mix plan to render as given (e.g. an edited suggested_plan)"),
     seconds: float = Form(DEFAULT_MIX_SECONDS),
     keylock: bool = Form(True),
     head_sec: float = Form(HEAD_SEC, description="with files_b: crossfade into each B; 0 = hard cut"),
     tail_sec: float = Form(TAIL_SEC, description="with files_b: max length of the last B's mix into C"),
     format: str = Form(DEFAULT_MIX_FORMAT, description="output format: opus or wav"),
-    grid: str = Form(DEFAULT_MIX_GRID, description="beat-grid phase source: beats (detected beats) or kicks (low-band onsets, falling back to beats)"),
+    grid: str | None = Form(None, description="beat-grid phase source: beats (detected beats, default) or kicks (low-band onsets, falling back to beats); defaults to the analysis's grid with analysis_id"),
 ) -> FileResponse:
     """Without files_b: analyze A's tail and C's head, plan a beat-aligned
     crossfade (mixer.plan_mix) and render it. With files_b: A and the B tracks
     are stitched together and only the last B is mixed into C (chain.render_chain).
-    Returns the mix as Ogg Opus (default) or WAV; the plan comes back as the X-Mix-Plan header."""
-    tmp_a = tmp_c = tmp_out = None
-    tmp_b: list[str] = []
+    Returns the mix as Ogg Opus (default) or WAV; the plan comes back as the X-Mix-Plan header.
+    With analysis_id the files come from /mix/analyze; with plan that plan is
+    rendered as given instead of planning one."""
+    analysis = _get_analysis(analysis_id) if analysis_id else None
+    grid = grid or (analysis.grid if analysis else DEFAULT_MIX_GRID)
+    owned: list[str] = []
+    tmp_out = None
     try:
         _check_format(format)
         _check_grid(grid)
-        tmp_a = await _save_upload(file_a)
-        for upload in _present(files_b):
-            tmp_b.append(await _save_upload(upload))
-        tmp_c = await _save_upload(file_c)
+        user_plan = _check_plan(plan) if plan is not None else None
+        path_a, path_c, owned = await _mix_sources(_upload(file_a), _upload(file_c), analysis)
+        tmp_b = [await _save_upload(u) for u in _present(files_b)]
+        owned += tmp_b
         fd, tmp_out = tempfile.mkstemp(suffix=f".{format}")
         os.close(fd)
 
         if tmp_b:
-            plan = await run_in_threadpool(render_chain, tmp_a, tmp_b, tmp_c, tmp_out, head_sec, tail_sec, None, format)
+            mix_plan = await run_in_threadpool(render_chain, path_a, tmp_b, path_c, tmp_out, head_sec, tail_sec, None, format)
         else:
-            map_a = await run_in_threadpool(spectral_map, tmp_a, "tail", seconds)
-            map_c = await run_in_threadpool(spectral_map, tmp_c, "head", seconds)
-            plan = await run_in_threadpool(plan_mix, map_a, map_c, grid)
-            plan = _absolutize_plan(plan, map_a["segment_offset_sec"])
-            await run_in_threadpool(render_mix, plan, tmp_a, tmp_c, tmp_out, keylock, format)
+            mix_plan = await run_in_threadpool(_plan_for, path_a, path_c, analysis, user_plan, seconds, grid)
+            await run_in_threadpool(render_mix, mix_plan, path_a, path_c, tmp_out, keylock, format)
 
         return FileResponse(
             tmp_out,
             media_type=MEDIA_TYPES[format],
             filename=f"mix.{format}",
-            headers={"X-Mix-Plan": json.dumps(plan)},
-            background=BackgroundTask(_cleanup, tmp_a, *tmp_b, tmp_c, tmp_out),
+            headers={"X-Mix-Plan": json.dumps(mix_plan)},
+            background=BackgroundTask(_cleanup, *owned, tmp_out),
         )
     except (ValueError, RuntimeError) as e:
-        _cleanup(tmp_a, *tmp_b, tmp_c, tmp_out)
+        _cleanup(*owned, tmp_out)
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
-        logger.exception("Mix failed for %s / %s", file_a.filename, file_c.filename)
-        _cleanup(tmp_a, *tmp_b, tmp_c, tmp_out)
+        logger.exception("Mix failed (analysis_id=%s)", analysis_id)
+        _cleanup(*owned, tmp_out)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
@@ -268,7 +404,8 @@ async def _emit(job: MixJob, job_id: str, name: str, status: str, error_message:
 
 
 async def _run_mix_job(job: MixJob, job_id: str, tmp_a: str, tmp_c: str, tmp_b: list[str], seconds: float,
-                       keylock: bool, head_sec: float, tail_sec: float, fmt: str, grid: str) -> None:
+                       keylock: bool, head_sec: float, tail_sec: float, fmt: str, grid: str,
+                       analysis: MixAnalysis | None, user_plan: dict | None, owned: list[str]) -> None:
     tmp_out = None
     try:
         fd, tmp_out = tempfile.mkstemp(suffix=f".{fmt}")
@@ -282,13 +419,20 @@ async def _run_mix_job(job: MixJob, job_id: str, tmp_a: str, tmp_c: str, tmp_b: 
             job.plan = await run_in_threadpool(
                 render_chain, tmp_a, tmp_b, tmp_c, tmp_out, head_sec, tail_sec, progress, fmt)
         else:
-            await _emit(job, job_id, "Analyzing outgoing track's tail", "PROCESSING")
-            map_a = await run_in_threadpool(spectral_map, tmp_a, "tail", seconds)
-            await _emit(job, job_id, "Analyzing incoming track's head", "PROCESSING")
-            map_c = await run_in_threadpool(spectral_map, tmp_c, "head", seconds)
-            await _emit(job, job_id, "Planning the crossfade", "PROCESSING")
-            plan = await run_in_threadpool(plan_mix, map_a, map_c, grid)
-            job.plan = _absolutize_plan(plan, map_a["segment_offset_sec"])
+            if user_plan is not None:
+                job.plan = user_plan
+            elif analysis:
+                await _emit(job, job_id, "Planning the crossfade", "PROCESSING")
+                plan = await run_in_threadpool(plan_mix, analysis.map_a, analysis.map_c, grid)
+                job.plan = _absolutize_plan(plan, analysis.map_a["segment_offset_sec"])
+            else:
+                await _emit(job, job_id, "Analyzing outgoing track's tail", "PROCESSING")
+                map_a = await run_in_threadpool(spectral_map, tmp_a, "tail", seconds)
+                await _emit(job, job_id, "Analyzing incoming track's head", "PROCESSING")
+                map_c = await run_in_threadpool(spectral_map, tmp_c, "head", seconds)
+                await _emit(job, job_id, "Planning the crossfade", "PROCESSING")
+                plan = await run_in_threadpool(plan_mix, map_a, map_c, grid)
+                job.plan = _absolutize_plan(plan, map_a["segment_offset_sec"])
             await _emit(job, job_id, "Rendering the mix", "PROCESSING")
             await run_in_threadpool(render_mix, job.plan, tmp_a, tmp_c, tmp_out, keylock, fmt)
         job.result_path = tmp_out
@@ -306,37 +450,45 @@ async def _run_mix_job(job: MixJob, job_id: str, tmp_a: str, tmp_c: str, tmp_b: 
         _cleanup(tmp_out)
         await _emit(job, job_id, "Mix failed", "ERROR", str(e))
     finally:
-        _cleanup(tmp_a, *tmp_b, tmp_c)
+        _cleanup(*owned)
 
 
 @app.post("/mix/jobs", status_code=202)
 async def create_mix_job(
-    file_a: UploadFile = File(..., description="outgoing track (tail is analyzed)"),
-    file_c: UploadFile = File(..., description="incoming track (head is analyzed unless files_b is given)"),
+    file_a: UploadFile | None = File(None, description="outgoing track (tail is analyzed); omit with analysis_id"),
+    file_c: UploadFile | None = File(None, description="incoming track (head is analyzed unless files_b is given); omit with analysis_id"),
     files_b: list[UploadFile] | None = File(None, description="optional effect/voice tracks between A and C, in play order (not analyzed)"),
+    analysis_id: str | None = Form(None, description="use the files (and maps) of a /mix/analyze result"),
+    plan: str | None = Form(None, description="JSON mix plan to render as given (e.g. an edited suggested_plan)"),
     seconds: float = Form(DEFAULT_MIX_SECONDS),
     keylock: bool = Form(True),
     head_sec: float = Form(HEAD_SEC),
     tail_sec: float = Form(TAIL_SEC),
     format: str = Form(DEFAULT_MIX_FORMAT, description="output format: opus or wav"),
-    grid: str = Form(DEFAULT_MIX_GRID, description="beat-grid phase source: beats (detected beats) or kicks (low-band onsets, falling back to beats)"),
+    grid: str | None = Form(None, description="beat-grid phase source: beats (detected beats, default) or kicks (low-band onsets, falling back to beats); defaults to the analysis's grid with analysis_id"),
 ) -> dict:
     """Start a /mix run in the background and return a job_id immediately.
     Progress streams from GET /mix/jobs/{job_id}/events (SSE); the finished
     mix (Ogg Opus by default) is fetched from GET /mix/jobs/{job_id}/result."""
+    analysis = _get_analysis(analysis_id) if analysis_id else None
+    grid = grid or (analysis.grid if analysis else DEFAULT_MIX_GRID)
+    owned: list[str] = []
     try:
         _check_format(format)
         _check_grid(grid)
+        user_plan = _check_plan(plan) if plan is not None else None
+        tmp_a, tmp_c, owned = await _mix_sources(_upload(file_a), _upload(file_c), analysis)
     except ValueError as e:
+        _cleanup(*owned)
         raise HTTPException(status_code=400, detail=str(e)) from e
-    tmp_a = await _save_upload(file_a)
     tmp_b = [await _save_upload(u) for u in _present(files_b)]
-    tmp_c = await _save_upload(file_c)
+    owned += tmp_b
     job_id = uuid.uuid4().hex
     job = MixJob(format=format)
     _mix_jobs[job_id] = job
     task = asyncio.create_task(
-        _run_mix_job(job, job_id, tmp_a, tmp_c, tmp_b, seconds, keylock, head_sec, tail_sec, format, grid))
+        _run_mix_job(job, job_id, tmp_a, tmp_c, tmp_b, seconds, keylock, head_sec, tail_sec, format, grid,
+                     analysis, user_plan, owned))
     _mix_tasks.add(task)
     task.add_done_callback(_mix_tasks.discard)
     return {"job_id": job_id}

@@ -55,6 +55,12 @@ MOOD_MODELS = {
     "party": "mood_party-discogs-effnet-1",
 }
 DANCEABILITY_MODEL = "danceability-discogs-effnet-1"
+VOICE_MODEL = "voice_instrumental-discogs-effnet-1"
+EMBEDDING_SR = 16000
+# TensorflowPredictEffnetDiscogs defaults: 128-frame patches, 62-frame hop, 256-sample frame hop at 16 kHz.
+EMBEDDING_PATCH_SEC = 128 * 256 / EMBEDDING_SR
+EMBEDDING_HOP_SEC = 62 * 256 / EMBEDDING_SR
+VOICE_THRESHOLD = 0.5
 
 
 def load_labels(model_name: str) -> list[str]:
@@ -89,6 +95,12 @@ class ModelBundle:
         self.dance_labels = load_labels(DANCEABILITY_MODEL)
         self.dance_model = es.TensorflowPredict2D(
             graphFilename=os.path.join(MODELS_DIR, f"{DANCEABILITY_MODEL}.pb"),
+            output="model/Softmax",
+        )
+
+        self.voice_labels = load_labels(VOICE_MODEL)
+        self.voice_model = es.TensorflowPredict2D(
+            graphFilename=os.path.join(MODELS_DIR, f"{VOICE_MODEL}.pb"),
             output="model/Softmax",
         )
 
@@ -280,6 +292,29 @@ def spectral_map(path: str, segment: str, seconds: float) -> dict:
         "scale": scale,
         "key_strength": round(float(key_strength), 3),
     }
+
+
+def _merge_segments(active: np.ndarray, hop: float, patch: float, limit: float) -> list[dict]:
+    """[start, end] seconds of runs of active patches (patch i covers
+    i*hop .. i*hop + patch), merged where they touch, clipped to [0, limit]."""
+    segments = []
+    for i in np.flatnonzero(active):
+        start, end = i * hop, min(i * hop + patch, limit)
+        if segments and start <= segments[-1]["end"]:
+            segments[-1]["end"] = round(float(end), 3)
+        else:
+            segments.append({"start": round(float(start), 3), "end": round(float(end), 3)})
+    return segments
+
+
+def vocal_segments(path: str, segment: str, seconds: float) -> list[dict]:
+    """Where vocals are in the head/tail segment (segment-relative seconds), from
+    the voice/instrumental head on Discogs-EffNet embeddings, ~1 s resolution."""
+    models = get_model_bundle()
+    audio, _ = _load_mono(path, sample_rate=EMBEDDING_SR)
+    seg = _segment_audio(audio, segment, seconds, EMBEDDING_SR)
+    probs = models.voice_model(models.embedding_model(seg))[:, models.voice_labels.index("voice")]
+    return _merge_segments(probs >= VOICE_THRESHOLD, EMBEDDING_HOP_SEC, EMBEDDING_PATCH_SEC, len(seg) / EMBEDDING_SR)
 
 
 def is_music(result: dict) -> bool:

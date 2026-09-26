@@ -12,6 +12,8 @@ MODEL_BASE_URLS = {
     "mood_aggressive-discogs-effnet-1.pb": "https://essentia.upf.edu/models/classification-heads/mood_aggressive/mood_aggressive-discogs-effnet-1.pb",
     "mood_party-discogs-effnet-1.pb": "https://essentia.upf.edu/models/classification-heads/mood_party/mood_party-discogs-effnet-1.pb",
     "danceability-discogs-effnet-1.pb": "https://essentia.upf.edu/models/classification-heads/danceability/danceability-discogs-effnet-1.pb",
+    "voice_instrumental-discogs-effnet-1.pb": "https://essentia.upf.edu/models/classification-heads/voice_instrumental/voice_instrumental-discogs-effnet-1.pb",
+    "voice_instrumental-discogs-effnet-1.json": "https://essentia.upf.edu/models/classification-heads/voice_instrumental/voice_instrumental-discogs-effnet-1.json",
 }
 
 
