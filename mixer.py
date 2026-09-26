@@ -12,6 +12,7 @@ BEATS_PER_BAR = 4
 MAX_TEMPO_SHIFT = 0.08
 RATE_RETURN_BEATS = 32
 MIN_GRID_STRENGTH = 0.3
+GRID_SOURCES = ("beats", "kicks")
 SILENCE_DB = 30.0
 CONTEXT_SEC = 2.0
 MAX_GAIN_DB = 6.0
@@ -80,13 +81,14 @@ def _phase(anchors: np.ndarray, period: float) -> tuple[float, float]:
     return float((np.angle(z) % (2 * np.pi)) / (2 * np.pi) * period), float(abs(z))
 
 
-def _beat_grid(track: Track) -> tuple[np.ndarray, dict]:
-    """Regular grid at the track's BPM. Phased on low-band onsets (kick hits)
-    when they are periodic enough, otherwise on detected beats."""
+def _beat_grid(track: Track, grid: str) -> tuple[np.ndarray, dict]:
+    """Regular grid at the track's BPM, phased on detected beats; with
+    grid="kicks", on low-band onsets (kick hits) when they are periodic
+    enough, falling back to detected beats."""
     period = 60 / track.bpm
     t0, t1 = track.times[0], track.times[-1]
     source, phase, strength = "none", t0, 0.0
-    if len(track.low_onsets):
+    if grid == "kicks" and len(track.low_onsets):
         phase, strength = _phase(track.low_onsets, period)
         source = "low_onsets"
     if strength < MIN_GRID_STRENGTH and len(track.beats):
@@ -190,14 +192,16 @@ def _tempo(c: Track, c_in: float, rate: float, length: float) -> list[dict]:
     return frames
 
 
-def plan_mix(map_a: dict, map_c: dict) -> dict:
+def plan_mix(map_a: dict, map_c: dict, grid: str = "beats") -> dict:
+    if grid not in GRID_SOURCES:
+        raise ValueError(f"grid must be one of {GRID_SOURCES}, got {grid!r}")
     a, c = Track(map_a), Track(map_c)
     rate, tempo_matched = tempo_rate(a.bpm, c.bpm)
     beat = 60 / a.bpm
     _, a_end = _content_bounds(a)
     c_start, _ = _content_bounds(c)
 
-    (a_grid, a_grid_info), (c_grid, c_grid_info) = _beat_grid(a), _beat_grid(c)
+    (a_grid, a_grid_info), (c_grid, c_grid_info) = _beat_grid(a, grid), _beat_grid(c, grid)
     a_beats = a_grid[a_grid <= a_end]
     c_entries = c_grid[c_grid >= c_start - c.hop][:C_ENTRY_BEATS]
     if not len(c_entries):

@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
 from chain import HEAD_SEC, TAIL_SEC, render_chain
-from mixer import plan_mix
+from mixer import GRID_SOURCES, plan_mix
 from render import OUTPUT_FORMATS, render as render_mix
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
@@ -27,6 +27,8 @@ DEFAULT_MIX_FORMAT = "opus"
 MEDIA_TYPES = {"opus": "audio/ogg", "wav": "audio/wav"}
 MIX_JOB_TTL_SECONDS = 1800
 MIX_JOB_REAP_INTERVAL_SECONDS = 300
+DEFAULT_MIX_GRID = "beats"
+SSE_KEEPALIVE_SECONDS = 15
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("spectra.service")
@@ -40,9 +42,10 @@ class AnalyzeRequest(BaseModel):
 
 @dataclass
 class MixJob:
-    """In-memory state for one /mix/jobs run: a queue of progress events an
-    SSE stream reads from, plus the eventual result (or error)."""
-    queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    """In-memory state for one /mix/jobs run: the progress events so far (every
+    SSE stream replays them from the start), plus the eventual result (or error)."""
+    events: list[dict] = field(default_factory=list)
+    changed: asyncio.Condition = field(default_factory=asyncio.Condition)
     status: str = "running"  # running, done, error
     created_at: float = field(default_factory=time.monotonic)
     result_path: str | None = None
@@ -52,6 +55,7 @@ class MixJob:
 
 
 _mix_jobs: dict[str, MixJob] = {}
+_mix_tasks: set[asyncio.Task] = set()  # strong refs so running jobs aren't garbage-collected
 
 
 async def _reap_mix_jobs() -> None:
@@ -167,6 +171,11 @@ def _check_format(fmt: str) -> None:
         raise ValueError(f"unsupported format {fmt!r}; use one of {', '.join(OUTPUT_FORMATS)}")
 
 
+def _check_grid(grid: str) -> None:
+    if grid not in GRID_SOURCES:
+        raise ValueError(f"unsupported grid {grid!r}; use one of {', '.join(GRID_SOURCES)}")
+
+
 def _present(uploads: list[UploadFile] | None) -> list[UploadFile]:
     """Uploads that actually carry a file (some clients send an empty part for an unused list field)."""
     return [u for u in uploads or [] if u.filename]
@@ -206,6 +215,7 @@ async def mix_tracks(
     head_sec: float = Form(HEAD_SEC, description="with files_b: crossfade into each B; 0 = hard cut"),
     tail_sec: float = Form(TAIL_SEC, description="with files_b: max length of the last B's mix into C"),
     format: str = Form(DEFAULT_MIX_FORMAT, description="output format: opus or wav"),
+    grid: str = Form(DEFAULT_MIX_GRID, description="beat-grid phase source: beats (detected beats) or kicks (low-band onsets, falling back to beats)"),
 ) -> FileResponse:
     """Without files_b: analyze A's tail and C's head, plan a beat-aligned
     crossfade (mixer.plan_mix) and render it. With files_b: A and the B tracks
@@ -215,6 +225,7 @@ async def mix_tracks(
     tmp_b: list[str] = []
     try:
         _check_format(format)
+        _check_grid(grid)
         tmp_a = await _save_upload(file_a)
         for upload in _present(files_b):
             tmp_b.append(await _save_upload(upload))
@@ -227,7 +238,7 @@ async def mix_tracks(
         else:
             map_a = await run_in_threadpool(spectral_map, tmp_a, "tail", seconds)
             map_c = await run_in_threadpool(spectral_map, tmp_c, "head", seconds)
-            plan = await run_in_threadpool(plan_mix, map_a, map_c)
+            plan = await run_in_threadpool(plan_mix, map_a, map_c, grid)
             plan = _absolutize_plan(plan, map_a["segment_offset_sec"])
             await run_in_threadpool(render_mix, plan, tmp_a, tmp_c, tmp_out, keylock, format)
 
@@ -251,11 +262,13 @@ async def _emit(job: MixJob, job_id: str, name: str, status: str, error_message:
     """SSEProgressDTO-shaped event (id/name/status/errorMessage) — matches the
     com.semantyca.core / io.kneo.broadcaster SSE progress convention so aivox
     can deserialize it directly. status is PROCESSING, DONE or ERROR."""
-    await job.queue.put({"id": job_id, "name": name, "status": status, "errorMessage": error_message})
+    async with job.changed:
+        job.events.append({"id": job_id, "name": name, "status": status, "errorMessage": error_message})
+        job.changed.notify_all()
 
 
 async def _run_mix_job(job: MixJob, job_id: str, tmp_a: str, tmp_c: str, tmp_b: list[str], seconds: float,
-                       keylock: bool, head_sec: float, tail_sec: float, fmt: str) -> None:
+                       keylock: bool, head_sec: float, tail_sec: float, fmt: str, grid: str) -> None:
     tmp_out = None
     try:
         fd, tmp_out = tempfile.mkstemp(suffix=f".{fmt}")
@@ -274,7 +287,7 @@ async def _run_mix_job(job: MixJob, job_id: str, tmp_a: str, tmp_c: str, tmp_b: 
             await _emit(job, job_id, "Analyzing incoming track's head", "PROCESSING")
             map_c = await run_in_threadpool(spectral_map, tmp_c, "head", seconds)
             await _emit(job, job_id, "Planning the crossfade", "PROCESSING")
-            plan = await run_in_threadpool(plan_mix, map_a, map_c)
+            plan = await run_in_threadpool(plan_mix, map_a, map_c, grid)
             job.plan = _absolutize_plan(plan, map_a["segment_offset_sec"])
             await _emit(job, job_id, "Rendering the mix", "PROCESSING")
             await run_in_threadpool(render_mix, job.plan, tmp_a, tmp_c, tmp_out, keylock, fmt)
@@ -306,12 +319,14 @@ async def create_mix_job(
     head_sec: float = Form(HEAD_SEC),
     tail_sec: float = Form(TAIL_SEC),
     format: str = Form(DEFAULT_MIX_FORMAT, description="output format: opus or wav"),
+    grid: str = Form(DEFAULT_MIX_GRID, description="beat-grid phase source: beats (detected beats) or kicks (low-band onsets, falling back to beats)"),
 ) -> dict:
     """Start a /mix run in the background and return a job_id immediately.
     Progress streams from GET /mix/jobs/{job_id}/events (SSE); the finished
     mix (Ogg Opus by default) is fetched from GET /mix/jobs/{job_id}/result."""
     try:
         _check_format(format)
+        _check_grid(grid)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     tmp_a = await _save_upload(file_a)
@@ -320,7 +335,10 @@ async def create_mix_job(
     job_id = uuid.uuid4().hex
     job = MixJob(format=format)
     _mix_jobs[job_id] = job
-    asyncio.create_task(_run_mix_job(job, job_id, tmp_a, tmp_c, tmp_b, seconds, keylock, head_sec, tail_sec, format))
+    task = asyncio.create_task(
+        _run_mix_job(job, job_id, tmp_a, tmp_c, tmp_b, seconds, keylock, head_sec, tail_sec, format, grid))
+    _mix_tasks.add(task)
+    task.add_done_callback(_mix_tasks.discard)
     return {"job_id": job_id}
 
 
@@ -331,10 +349,24 @@ async def mix_job_events(job_id: str) -> StreamingResponse:
         raise HTTPException(status_code=404, detail="job not found")
 
     async def event_stream():
+        """Replays all events so far, then follows new ones; sends an SSE comment
+        every SSE_KEEPALIVE_SECONDS of silence so proxies don't time the stream out."""
+        sent = 0
         while True:
-            event = await job.queue.get()
-            yield f"data: {json.dumps(event)}\n\n"
-            if event["status"] in ("DONE", "ERROR"):
+            async with job.changed:
+                if sent >= len(job.events):
+                    try:
+                        await asyncio.wait_for(job.changed.wait(), SSE_KEEPALIVE_SECONDS)
+                    except TimeoutError:
+                        pass
+                pending = job.events[sent:]
+            if not pending:
+                yield ": keepalive\n\n"
+                continue
+            for event in pending:
+                yield f"data: {json.dumps(event)}\n\n"
+            sent += len(pending)
+            if pending[-1]["status"] in ("DONE", "ERROR"):
                 break
 
     return StreamingResponse(

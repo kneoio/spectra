@@ -174,7 +174,10 @@ def analyze(path: str) -> dict:
 SPECTRAL_MAP_SR = 44100
 SPECTRAL_MAP_FRAME_SIZE = 2048
 SPECTRAL_MAP_HOP_SIZE = 1024
-LOW_ONSET_CUTOFF_HZ = 250.0
+LOW_ONSET_CUTOFF_HZ = 150.0
+LOW_ONSET_HOP_SEC = 0.005
+LOW_ONSET_RISE_DB = 10.0
+LOW_ONSET_MIN_GAP_SEC = 0.1
 
 # (low_hz, high_hz) per band, covering 0..sr/2.
 BAND_RANGES = {
@@ -196,6 +199,28 @@ def _segment_audio(audio: np.ndarray, segment: str, seconds: float, sr: int) -> 
     if segment == "head":
         return audio[:seg_len]
     raise ValueError(f"segment must be 'tail' or 'head', got {segment!r}")
+
+
+def _low_onsets(seg: np.ndarray, sr: int) -> np.ndarray:
+    """Attack times (s, segment-relative) of sharp low-band hits (kicks): local
+    peaks of the level rise over 10 ms that exceed LOW_ONSET_RISE_DB, at least
+    LOW_ONSET_MIN_GAP_SEC apart."""
+    low = es.LowPass(cutoffFrequency=LOW_ONSET_CUTOFF_HZ, sampleRate=sr)(seg)
+    hop = int(LOW_ONSET_HOP_SEC * sr)
+    n = len(low) // hop
+    if n < 3:
+        return np.zeros(0)
+    energy = (low[:n * hop].reshape(n, hop).astype(np.float64) ** 2).mean(axis=1)
+    level = 10 * np.log10(energy + 1e-12)
+    rise = np.zeros(n)
+    rise[1:-1] = level[2:] - level[:-2]
+    gap = int(LOW_ONSET_MIN_GAP_SEC * sr / hop)
+    onsets, last = [], -gap
+    for i in range(1, n - 1):
+        if rise[i] >= LOW_ONSET_RISE_DB and rise[i] >= rise[max(0, i - gap // 2):i + gap // 2 + 1].max() and i - last >= gap:
+            onsets.append(i)
+            last = i
+    return np.asarray(onsets) * hop / sr
 
 
 def spectral_map(path: str, segment: str, seconds: float) -> dict:
@@ -235,8 +260,7 @@ def spectral_map(path: str, segment: str, seconds: float) -> dict:
 
     bpm, beats, beats_confidence, _, _ = es.RhythmExtractor2013(method="multifeature")(seg)
 
-    lowpass = es.LowPass(cutoffFrequency=LOW_ONSET_CUTOFF_HZ, sampleRate=sr)
-    low_onsets, _ = es.OnsetRate()(lowpass(seg))
+    low_onsets = _low_onsets(seg, sr)
 
     key, scale, key_strength = es.KeyExtractor()(seg)
 
