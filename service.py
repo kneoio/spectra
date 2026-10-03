@@ -32,6 +32,7 @@ DEFAULT_MIX_GRID = "beats"
 SSE_KEEPALIVE_SECONDS = 15
 MIX_ANALYSIS_TTL_SECONDS = 1800
 MAX_PLAN_RATE_SHIFT = 0.5
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("spectra.service")
@@ -117,16 +118,9 @@ async def assess_track(file: UploadFile = File(...)) -> dict:
     back in the response (including is_music). Writes nothing to the database —
     used by jesoos chat (assess_track / upload_song) before a SoundFragment exists.
     """
-    suffix = os.path.splitext(file.filename or "")[1] or ".bin"
     tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp_path = tmp.name
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                tmp.write(chunk)
+        tmp_path = await _save_upload(file)
         result = await run_in_threadpool(analyze, tmp_path)
         result.pop("file", None)
         if "duration_sec" in result:
@@ -137,6 +131,8 @@ async def assess_track(file: UploadFile = File(...)) -> dict:
             file.filename, result["is_music"], result.get("duration_sec"), result.get("bpm"),
         )
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Assess failed for %s", file.filename)
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -154,17 +150,12 @@ async def spectral_map_track(
     """Band-energy/rhythm time series for one edge (head/tail) of an uploaded
     track — used by mixer.plan_mix to plan a beat-aligned crossfade. Writes
     nothing to the database."""
-    suffix = os.path.splitext(file.filename or "")[1] or ".bin"
     tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp_path = tmp.name
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                tmp.write(chunk)
+        tmp_path = await _save_upload(file)
         return await run_in_threadpool(spectral_map, tmp_path, segment, seconds)
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
@@ -176,16 +167,37 @@ async def spectral_map_track(
 
 
 async def _save_upload(file: UploadFile) -> str:
+    """Copy an upload to a temp file; 413 (and no temp file left) if it exceeds MAX_UPLOAD_BYTES."""
     suffix = os.path.splitext(file.filename or "")[1] or ".bin"
     fd, tmp_path = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
+    size = 0
     with open(tmp_path, "wb") as out:
         while True:
             chunk = await file.read(1024 * 1024)
             if not chunk:
                 break
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                out.close()
+                _cleanup(tmp_path)
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"{file.filename!r} exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit",
+                )
             out.write(chunk)
     return tmp_path
+
+
+async def _save_uploads(files: list[UploadFile], owned: list[str]) -> list[str]:
+    """Save each upload, appending every temp path to `owned` as it is created
+    so the caller can clean up all of them if a later one fails."""
+    paths = []
+    for f in files:
+        path = await _save_upload(f)
+        owned.append(path)
+        paths.append(path)
+    return paths
 
 
 def _check_format(fmt: str) -> None:
@@ -273,18 +285,17 @@ def _get_analysis(analysis_id: str) -> MixAnalysis:
 
 
 async def _mix_sources(file_a: UploadFile | None, file_c: UploadFile | None,
-                       analysis: MixAnalysis | None) -> tuple[str, str, list[str]]:
-    """(path_a, path_c, owned): the analysis's stored files, or the uploads saved
-    to temp files. `owned` lists the temp files the caller must delete."""
+                       analysis: MixAnalysis | None, owned: list[str]) -> tuple[str, str]:
+    """(path_a, path_c): the analysis's stored files, or the uploads saved to
+    temp files, which are appended to `owned` for the caller to delete."""
     if analysis:
         if file_a or file_c:
             raise ValueError("send either analysis_id or file_a/file_c, not both")
-        return analysis.path_a, analysis.path_c, []
+        return analysis.path_a, analysis.path_c
     if not (file_a and file_c):
         raise ValueError("file_a and file_c are required without analysis_id")
-    path_a = await _save_upload(file_a)
-    path_c = await _save_upload(file_c)
-    return path_a, path_c, [path_a, path_c]
+    path_a, path_c = await _save_uploads([file_a, file_c], owned)
+    return path_a, path_c
 
 
 def _plan_for(path_a: str, path_c: str, analysis: MixAnalysis | None, plan: dict | None,
@@ -324,6 +335,9 @@ async def analyze_mix(
         vocals_c = await run_in_threadpool(vocal_segments, path_c, "head", seconds)
         report = transition_report(map_a, map_c, vocals_a, vocals_c, grid)
         plan = _absolutize_plan(plan_mix(map_a, map_c, grid), map_a["segment_offset_sec"])
+    except HTTPException:
+        _cleanup(path_a, path_c)
+        raise
     except ValueError as e:
         _cleanup(path_a, path_c)
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -366,9 +380,8 @@ async def mix_tracks(
         _check_format(format)
         _check_grid(grid)
         user_plan = _check_plan(plan) if plan is not None else None
-        path_a, path_c, owned = await _mix_sources(_upload(file_a), _upload(file_c), analysis)
-        tmp_b = [await _save_upload(u) for u in _present(files_b)]
-        owned += tmp_b
+        path_a, path_c = await _mix_sources(_upload(file_a), _upload(file_c), analysis, owned)
+        tmp_b = await _save_uploads(_present(files_b), owned)
         fd, tmp_out = tempfile.mkstemp(suffix=f".{format}")
         os.close(fd)
 
@@ -385,6 +398,9 @@ async def mix_tracks(
             headers={"X-Mix-Plan": json.dumps(mix_plan)},
             background=BackgroundTask(_cleanup, *owned, tmp_out),
         )
+    except HTTPException:
+        _cleanup(*owned, tmp_out)
+        raise
     except (ValueError, RuntimeError) as e:
         _cleanup(*owned, tmp_out)
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -477,12 +493,14 @@ async def create_mix_job(
         _check_format(format)
         _check_grid(grid)
         user_plan = _check_plan(plan) if plan is not None else None
-        tmp_a, tmp_c, owned = await _mix_sources(_upload(file_a), _upload(file_c), analysis)
+        tmp_a, tmp_c = await _mix_sources(_upload(file_a), _upload(file_c), analysis, owned)
+        tmp_b = await _save_uploads(_present(files_b), owned)
+    except HTTPException:
+        _cleanup(*owned)
+        raise
     except ValueError as e:
         _cleanup(*owned)
         raise HTTPException(status_code=400, detail=str(e)) from e
-    tmp_b = [await _save_upload(u) for u in _present(files_b)]
-    owned += tmp_b
     job_id = uuid.uuid4().hex
     job = MixJob(format=format)
     _mix_jobs[job_id] = job
