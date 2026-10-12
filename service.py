@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 
 from chain import HEAD_SEC, TAIL_SEC, render_chain
 from mixer import GRID_SOURCES, plan_mix
-from render import BANDS, OUTPUT_FORMATS, render as render_mix
+from render import BANDS, OUTPUT_FORMATS, render as render_mix, transition_bounds
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -365,6 +365,7 @@ async def mix_tracks(
     tail_sec: float = Form(TAIL_SEC, description="with files_b: max length of the last B's mix into C"),
     format: str = Form(DEFAULT_MIX_FORMAT, description="output format: opus or wav"),
     grid: str | None = Form(None, description="beat-grid phase source: beats (detected beats, default) or kicks (low-band onsets, falling back to beats); defaults to the analysis's grid with analysis_id"),
+    transition_only: bool = Form(False, description="return only the transition clip (plan.transition: a_start_sec, duration_sec, c_resume_sec) instead of the whole A->C mix; ignored with files_b"),
 ) -> FileResponse:
     """Without files_b: analyze A's tail and C's head, plan a beat-aligned
     crossfade (mixer.plan_mix) and render it. With files_b: A and the B tracks
@@ -389,7 +390,9 @@ async def mix_tracks(
             mix_plan = await run_in_threadpool(render_chain, path_a, tmp_b, path_c, tmp_out, head_sec, tail_sec, None, format)
         else:
             mix_plan = await run_in_threadpool(_plan_for, path_a, path_c, analysis, user_plan, seconds, grid)
-            await run_in_threadpool(render_mix, mix_plan, path_a, path_c, tmp_out, keylock, format)
+            if transition_only:
+                mix_plan["transition"] = transition_bounds(mix_plan)
+            await run_in_threadpool(render_mix, mix_plan, path_a, path_c, tmp_out, keylock, format, transition_only)
 
         return FileResponse(
             tmp_out,
@@ -421,7 +424,8 @@ async def _emit(job: MixJob, job_id: str, name: str, status: str, error_message:
 
 async def _run_mix_job(job: MixJob, job_id: str, tmp_a: str, tmp_c: str, tmp_b: list[str], seconds: float,
                        keylock: bool, head_sec: float, tail_sec: float, fmt: str, grid: str,
-                       analysis: MixAnalysis | None, user_plan: dict | None, owned: list[str]) -> None:
+                       analysis: MixAnalysis | None, user_plan: dict | None, owned: list[str],
+                       transition_only: bool = False) -> None:
     tmp_out = None
     try:
         fd, tmp_out = tempfile.mkstemp(suffix=f".{fmt}")
@@ -449,8 +453,10 @@ async def _run_mix_job(job: MixJob, job_id: str, tmp_a: str, tmp_c: str, tmp_b: 
                 await _emit(job, job_id, "Planning the crossfade", "PROCESSING")
                 plan = await run_in_threadpool(plan_mix, map_a, map_c, grid)
                 job.plan = _absolutize_plan(plan, map_a["segment_offset_sec"])
+            if transition_only:
+                job.plan["transition"] = transition_bounds(job.plan)
             await _emit(job, job_id, "Rendering the mix", "PROCESSING")
-            await run_in_threadpool(render_mix, job.plan, tmp_a, tmp_c, tmp_out, keylock, fmt)
+            await run_in_threadpool(render_mix, job.plan, tmp_a, tmp_c, tmp_out, keylock, fmt, transition_only)
         job.result_path = tmp_out
         job.status = "done"
         await _emit(job, job_id, "Mix ready", "DONE")
@@ -482,6 +488,7 @@ async def create_mix_job(
     tail_sec: float = Form(TAIL_SEC),
     format: str = Form(DEFAULT_MIX_FORMAT, description="output format: opus or wav"),
     grid: str | None = Form(None, description="beat-grid phase source: beats (detected beats, default) or kicks (low-band onsets, falling back to beats); defaults to the analysis's grid with analysis_id"),
+    transition_only: bool = Form(False, description="return only the transition clip (plan.transition) instead of the whole A->C mix; ignored with files_b"),
 ) -> dict:
     """Start a /mix run in the background and return a job_id immediately.
     Progress streams from GET /mix/jobs/{job_id}/events (SSE); the finished
@@ -506,7 +513,7 @@ async def create_mix_job(
     _mix_jobs[job_id] = job
     task = asyncio.create_task(
         _run_mix_job(job, job_id, tmp_a, tmp_c, tmp_b, seconds, keylock, head_sec, tail_sec, format, grid,
-                     analysis, user_plan, owned))
+                     analysis, user_plan, owned, transition_only))
     _mix_tasks.add(task)
     task.add_done_callback(_mix_tasks.discard)
     return {"job_id": job_id}

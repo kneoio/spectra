@@ -227,8 +227,36 @@ def write_audio(mix: np.ndarray, out_path: str, fmt: str = "wav", sr: int = REND
         sf.write(out_path, mix, sr, subtype="PCM_24")
 
 
-def render(plan: dict, path_a: str, path_c: str, out_path: str, keylock: bool = True, fmt: str = "wav") -> None:
-    write_audio(mix_audio(plan, path_a, path_c, keylock), out_path, fmt)
+def transition_bounds(plan: dict, sr: int = RENDER_SR) -> dict:
+    """The clip of the mix a player needs: it starts where A's mix begins and
+    ends once C is back at rate 1.0 (the end of the plan's tempo curve), so
+    C continues from c_resume_sec of its own file at normal speed."""
+    start_sec = float(plan["a"]["mix_start_sec"])
+    c_start = float(plan["c"]["start_from_sec"])
+    overlap_sec = float(plan["a"]["stop_sec"]) - start_sec
+    pts = sorted(plan["tempo"], key=lambda p: p["c_time"])
+    local = [{"c_time": p["c_time"] - c_start, "rate": p["rate"]} for p in pts]
+    segments = _expand_ramp_segments(_rate_segments(local, local[-1]["c_time"]))
+    warped_sec = sum((c1 - c0) / rate for c0, c1, rate in segments)
+    c_resume_sec = pts[-1]["c_time"]
+    if warped_sec < overlap_sec:
+        c_resume_sec += overlap_sec - warped_sec
+        warped_sec = overlap_sec
+    return {
+        "a_start_sec": round(start_sec, 3),
+        "duration_sec": round(int(round(warped_sec * sr)) / sr, 3),
+        "c_resume_sec": round(c_resume_sec, 3),
+    }
+
+
+def render(plan: dict, path_a: str, path_c: str, out_path: str, keylock: bool = True, fmt: str = "wav",
+           transition_only: bool = False) -> None:
+    mix = mix_audio(plan, path_a, path_c, keylock)
+    if transition_only:
+        bounds = transition_bounds(plan)
+        start = int(round(bounds["a_start_sec"] * RENDER_SR))
+        mix = mix[start:start + int(round(bounds["duration_sec"] * RENDER_SR))]
+    write_audio(mix, out_path, fmt)
 
 
 def main() -> None:
