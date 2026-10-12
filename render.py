@@ -3,9 +3,12 @@ A into C on three bands per the plan's automation, warping C's speed to the
 plan's tempo curve (time-stretched with rubberband, or resampled vinyl-style)."""
 
 import argparse
+import io
 import json
 import math
+import os
 import shutil
+import subprocess
 import sys
 
 import numpy as np
@@ -13,6 +16,7 @@ import pyrubberband as pyrb
 import soundfile as sf
 from scipy import signal
 
+FFMPEG_PATH = os.environ.get("FFMPEG_PATH", "ffmpeg")
 RENDER_SR = 44100
 OPUS_SR = 48000
 OUTPUT_FORMATS = ("opus", "wav")
@@ -48,9 +52,25 @@ def _resample(x: np.ndarray, sr: int, target_sr: int) -> np.ndarray:
     return signal.resample_poly(x, target_sr // g, sr // g, axis=0)
 
 
+def _decode_with_ffmpeg(path: str) -> tuple[np.ndarray, int]:
+    try:
+        result = subprocess.run(
+            [FFMPEG_PATH, "-v", "error", "-i", path, "-vn", "-f", "wav", "-acodec", "pcm_f32le", "-"],
+            capture_output=True, check=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"cannot decode {path!r}: ffmpeg not found on PATH") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"ffmpeg failed to decode {path!r}: {exc.stderr.decode(errors='replace')}") from exc
+    return sf.read(io.BytesIO(result.stdout), dtype="float64", always_2d=True)
+
+
 def load_audio(path: str, target_sr: int = RENDER_SR) -> np.ndarray:
     """Stereo float64 audio at `target_sr`, mono upmixed and resampled as needed."""
-    data, sr = sf.read(path, dtype="float64", always_2d=True)
+    try:
+        data, sr = sf.read(path, dtype="float64", always_2d=True)
+    except (sf.LibsndfileError, RuntimeError):
+        data, sr = _decode_with_ffmpeg(path)
     return _resample(_to_stereo(data), sr, target_sr)
 
 
