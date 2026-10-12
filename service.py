@@ -284,6 +284,13 @@ def _get_analysis(analysis_id: str) -> MixAnalysis:
     return analysis
 
 
+def _mix_headers(plan: dict) -> dict:
+    headers = {"X-Mix-Plan": json.dumps(plan)}
+    if "transition" in plan:
+        headers["X-Mix-Transition"] = json.dumps(plan["transition"])
+    return headers
+
+
 async def _mix_sources(file_a: UploadFile | None, file_c: UploadFile | None,
                        analysis: MixAnalysis | None, owned: list[str]) -> tuple[str, str]:
     """(path_a, path_c): the analysis's stored files, or the uploads saved to
@@ -398,7 +405,7 @@ async def mix_tracks(
             tmp_out,
             media_type=MEDIA_TYPES[format],
             filename=f"mix.{format}",
-            headers={"X-Mix-Plan": json.dumps(mix_plan)},
+            headers=_mix_headers(mix_plan),
             background=BackgroundTask(_cleanup, *owned, tmp_out),
         )
     except HTTPException:
@@ -572,7 +579,7 @@ async def mix_job_result(job_id: str) -> FileResponse:
         job.result_path,
         media_type=MEDIA_TYPES[job.format],
         filename=f"mix.{job.format}",
-        headers={"X-Mix-Plan": json.dumps(job.plan)},
+        headers=_mix_headers(job.plan),
         background=BackgroundTask(_cleanup, job.result_path),
     )
 
