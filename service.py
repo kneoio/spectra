@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from chain import HEAD_SEC, TAIL_SEC, render_chain
 from mixer import GRID_SOURCES, plan_mix
 from render import BANDS, OUTPUT_FORMATS, render as render_mix, transition_bounds
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
@@ -22,6 +22,7 @@ from transition import transition_report
 from db import get_original_file_key, save_analysis
 from models_setup import ensure_models
 from storage import download_to_temp
+import security
 
 DEFAULT_MIX_SECONDS = 30.0
 DEFAULT_MIX_FORMAT = "opus"
@@ -87,6 +88,7 @@ async def _reap_mix_jobs() -> None:
             job = _mix_jobs.pop(job_id, None)
             if job:
                 _cleanup(job.result_path)
+        security.prune_rate_limits()
         cutoff = time.monotonic() - MIX_ANALYSIS_TTL_SECONDS
         stale = [aid for aid, an in _mix_analyses.items() if an.last_used < cutoff]
         for aid in stale:
@@ -97,6 +99,7 @@ async def _reap_mix_jobs() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    security.warn_if_open()
     ensure_models(quiet=True)
     get_model_bundle()  # build all TF graphs once, kept resident for the process lifetime
     reaper = asyncio.create_task(_reap_mix_jobs())
@@ -104,7 +107,14 @@ async def lifespan(app: FastAPI):
     reaper.cancel()
 
 
-app = FastAPI(title="Spectra", lifespan=lifespan)
+app = FastAPI(
+    title="Spectra",
+    lifespan=lifespan,
+    dependencies=[Depends(security.require_api_key)],
+    docs_url=None if security.API_KEY else "/docs",
+    redoc_url=None if security.API_KEY else "/redoc",
+    openapi_url=None if security.API_KEY else "/openapi.json",
+)
 
 
 @app.get("/health")
@@ -112,7 +122,7 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/assess")
+@app.post("/assess", dependencies=[Depends(security.rate_limit)])
 async def assess_track(file: UploadFile = File(...)) -> dict:
     """Synchronous pre-save assessment: upload a local audio file, get analysis
     back in the response (including is_music). Writes nothing to the database —
@@ -141,7 +151,7 @@ async def assess_track(file: UploadFile = File(...)) -> dict:
             os.remove(tmp_path)
 
 
-@app.post("/spectral-map")
+@app.post("/spectral-map", dependencies=[Depends(security.rate_limit)])
 async def spectral_map_track(
     file: UploadFile = File(...),
     segment: str = Form(...),
@@ -333,7 +343,7 @@ def _plan_for(path_a: str, path_c: str, analysis: MixAnalysis | None, plan: dict
     return _absolutize_plan(plan_mix(map_a, map_c, grid), map_a["segment_offset_sec"])
 
 
-@app.post("/mix/analyze")
+@app.post("/mix/analyze", dependencies=[Depends(security.rate_limit), Depends(security.mix_slot)])
 async def analyze_mix(
     file_a: UploadFile = File(..., description="outgoing track (tail is analyzed)"),
     file_c: UploadFile = File(..., description="incoming track (head is analyzed)"),
@@ -373,7 +383,7 @@ async def analyze_mix(
             **report, "suggested_plan": plan}
 
 
-@app.post("/mix")
+@app.post("/mix", dependencies=[Depends(security.rate_limit), Depends(security.mix_slot)])
 async def mix_tracks(
     file_a: UploadFile | None = File(None, description="outgoing track (tail is analyzed unless files_b is given); omit with analysis_id"),
     file_c: UploadFile | None = File(None, description="incoming track (head is analyzed unless files_b is given); omit with analysis_id"),
@@ -496,10 +506,11 @@ async def _run_mix_job(job: MixJob, job_id: str, tmp_a: str, tmp_c: str, tmp_b: 
         _cleanup(tmp_out)
         await _emit(job, job_id, "Mix failed", "ERROR", str(e))
     finally:
+        security.release_mix_slot()
         _cleanup(*owned)
 
 
-@app.post("/mix/jobs", status_code=202)
+@app.post("/mix/jobs", status_code=202, dependencies=[Depends(security.rate_limit)])
 async def create_mix_job(
     file_a: UploadFile | None = File(None, description="outgoing track (tail is analyzed); omit with analysis_id"),
     file_c: UploadFile | None = File(None, description="incoming track (head is analyzed unless files_b is given); omit with analysis_id"),
@@ -522,6 +533,7 @@ async def create_mix_job(
     analysis = _get_analysis(analysis_id) if analysis_id else None
     grid = grid or (analysis.grid if analysis else DEFAULT_MIX_GRID)
     owned: list[str] = []
+    security.acquire_mix_slot()
     try:
         _check_format(format)
         _check_grid(grid)
@@ -530,11 +542,17 @@ async def create_mix_job(
         tmp_a, tmp_c = await _mix_sources(_upload(file_a), _upload(file_c), analysis, owned)
         tmp_b = await _save_uploads(_present(files_b), owned)
     except HTTPException:
+        security.release_mix_slot()
         _cleanup(*owned)
         raise
     except ValueError as e:
+        security.release_mix_slot()
         _cleanup(*owned)
         raise HTTPException(status_code=400, detail=str(e)) from e
+    except BaseException:
+        security.release_mix_slot()
+        _cleanup(*owned)
+        raise
     job_id = uuid.uuid4().hex
     job = MixJob(format=format)
     _mix_jobs[job_id] = job
@@ -609,6 +627,7 @@ def _resolve_file(sound_fragment_id: str, path: str | None) -> tuple[str, bool]:
     materialize the ORIGINAL (non-opus) file from Hetzner, resolving its key from
     _files by the SoundFragment id. Returns (local_path, is_temp) — is_temp marks
     a downloaded copy spectra must delete."""
+    path = security.allowed_analyze_path(path)
     if path and os.path.isfile(path):
         return path, False
     file_key = get_original_file_key(sound_fragment_id)

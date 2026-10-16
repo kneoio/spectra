@@ -47,14 +47,16 @@ def multipart(fields: dict[str, str], files: dict[str, str]) -> tuple[bytes, str
 
 
 def request_transition(url: str, a_path: str, a_offset: float, c_path: str, c_offset: float,
-                       fmt: str, timeout: float) -> tuple[bytes, dict]:
+                       fmt: str, timeout: float, api_key: str = "") -> tuple[bytes, dict]:
     body, content_type = multipart(
         {"transition_only": "true", "format": fmt,
          "a_offset_sec": f"{a_offset:.3f}", "c_offset_sec": f"{c_offset:.3f}"},
         {"file_a": a_path, "file_c": c_path},
     )
-    req = urllib.request.Request(f"{url.rstrip('/')}/mix", data=body, method="POST",
-                                 headers={"Content-Type": content_type})
+    headers = {"Content-Type": content_type}
+    if api_key:
+        headers["X-API-Key"] = api_key
+    req = urllib.request.Request(f"{url.rstrip('/')}/mix", data=body, method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             header = resp.headers.get("X-Mix-Transition")
@@ -91,6 +93,7 @@ def main() -> None:
     parser.add_argument("song_a", help="outgoing song (full file)")
     parser.add_argument("song_c", help="incoming song (full file)")
     parser.add_argument("--url", default=DEFAULT_URL)
+    parser.add_argument("--api-key", default=os.environ.get("SPECTRA_API_KEY", ""))
     parser.add_argument("--out", default="mix_out", help="output directory")
     parser.add_argument("--excerpt", type=float, default=DEFAULT_EXCERPT_SEC, help="seconds cut from A's tail and C's head")
     parser.add_argument("--format", default="opus", choices=["opus", "wav"])
@@ -110,7 +113,7 @@ def main() -> None:
         sent = os.path.getsize(excerpt_a) + os.path.getsize(excerpt_c)
         full = os.path.getsize(args.song_a) + os.path.getsize(args.song_c)
         print(f"sending {sent / 1e6:.2f} MB (full songs: {full / 1e6:.2f} MB), A offset {a_offset:.1f}s")
-        clip, transition = request_transition(args.url, excerpt_a, a_offset, excerpt_c, 0.0, args.format, args.timeout)
+        clip, transition = request_transition(args.url, excerpt_a, a_offset, excerpt_c, 0.0, args.format, args.timeout, args.api_key)
 
     clip_path = os.path.join(args.out, f"clip.{args.format}")
     with open(clip_path, "wb") as f:

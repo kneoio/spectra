@@ -20,6 +20,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY . .
 
 ENV PATH="/app/.venv/bin:$PATH"
+ENV FORWARDED_ALLOW_IPS=*
 EXPOSE 38795
 
 CMD ["uvicorn", "service:app", "--host", "0.0.0.0", "--port", "38795"]
