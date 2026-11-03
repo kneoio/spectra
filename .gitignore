@@ -5,3 +5,5 @@ models/*.pb
 .idea/
 .env
 .claude/*.tmp.*
+mix.headers
+mix_out/
