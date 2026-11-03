@@ -1,6 +1,12 @@
 """Transition report for /mix/analyze: what stands out in A's tail and C's head
 (per-bar band levels, kicks, vocals, edge shape) and how compatible they are,
-for the interactive mixer UI. All times are absolute positions in each file."""
+for the interactive mixer UI. All times are absolute positions in each file.
+
+Run as a script to cut those pieces out of two full songs and POST only the
+pieces to /mix:
+
+    python transition.py song_a song_c
+"""
 
 import numpy as np
 
@@ -99,3 +105,81 @@ def transition_report(map_a: dict, map_c: dict, vocals_a: list[dict], vocals_c: 
             "vocal_clash_risk": any(b["vocal"] > 0 for b in a_last) and any(b["vocal"] > 0 for b in c_first),
         },
     }
+
+
+def _post_pieces(url: str, a_path: str, c_path: str, seconds: float, grid: str,
+                 fmt: str, timeout: float) -> tuple[bytes, dict]:
+    """POST the already-cut tail and head. The mix that comes back is only those pieces."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    from mix_client import multipart
+
+    body, content_type = multipart(
+        {"seconds": f"{seconds:.3f}", "grid": grid, "format": fmt},
+        {"file_a": a_path, "file_c": c_path},
+    )
+    req = urllib.request.Request(f"{url.rstrip('/')}/mix", data=body, method="POST",
+                                 headers={"Content-Type": content_type})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            plan_header = resp.headers.get("X-Mix-Plan")
+            audio = resp.read()
+    except urllib.error.HTTPError as e:
+        raise SystemExit(f"server returned {e.code}: {e.read().decode(errors='replace')}") from e
+    if not plan_header:
+        raise SystemExit("response has no X-Mix-Plan header")
+    return audio, json.loads(plan_header)
+
+
+def main() -> None:
+    import argparse
+    import json
+    import os
+    import tempfile
+
+    from mix_client import DEFAULT_EXCERPT_SEC, DEFAULT_URL, cut, duration_sec
+
+    parser = argparse.ArgumentParser(
+        description="Cut A's tail and C's head from two full songs and POST only those pieces to Spectra /mix.")
+    parser.add_argument("song_a", help="outgoing song (full file)")
+    parser.add_argument("song_c", help="incoming song (full file)")
+    parser.add_argument("--url", default=DEFAULT_URL)
+    parser.add_argument("--out", default="mix_out", help="output directory")
+    parser.add_argument("--excerpt", type=float, default=DEFAULT_EXCERPT_SEC,
+                        help="seconds cut from A's tail and C's head, and the analysis window")
+    parser.add_argument("--grid", default="beats", choices=["beats", "kicks"])
+    parser.add_argument("--format", default="wav", choices=["opus", "wav"])
+    parser.add_argument("--timeout", type=float, default=600.0)
+    args = parser.parse_args()
+
+    os.makedirs(args.out, exist_ok=True)
+    a_offset = max(0.0, duration_sec(args.song_a) - args.excerpt)
+    with tempfile.TemporaryDirectory() as tmp:
+        excerpt_a = os.path.join(tmp, "a_tail.ogg")
+        excerpt_c = os.path.join(tmp, "c_head.ogg")
+        cut(args.song_a, a_offset, args.excerpt, excerpt_a)
+        cut(args.song_c, 0.0, args.excerpt, excerpt_c)
+        sent = os.path.getsize(excerpt_a) + os.path.getsize(excerpt_c)
+        full = os.path.getsize(args.song_a) + os.path.getsize(args.song_c)
+        print(f"sending {sent / 1e6:.2f} MB of pieces (full songs: {full / 1e6:.2f} MB), A tail from {a_offset:.1f}s")
+        audio, plan = _post_pieces(args.url, excerpt_a, excerpt_c, args.excerpt, args.grid, args.format, args.timeout)
+
+    mix_path = os.path.join(args.out, f"mix.{args.format}")
+    with open(mix_path, "wb") as f:
+        f.write(audio)
+    with open(os.path.join(args.out, "plan.json"), "w") as f:
+        json.dump(plan, f, indent=2)
+    print(f"mix: {mix_path} ({len(audio) / 1e6:.2f} MB)")
+    print(json.dumps({"a": plan["a"], "c": plan["c"], "overlap_sec": plan.get("overlap_sec")}, indent=2))
+
+
+if __name__ == "__main__":
+    import subprocess
+    import sys
+
+    try:
+        main()
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"command failed: {' '.join(map(str, e.cmd))}")
