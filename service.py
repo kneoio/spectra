@@ -107,13 +107,13 @@ async def lifespan(app: FastAPI):
     reaper.cancel()
 
 
+_auth_configured = bool(security.API_KEY or security.OIDC_ISSUER)
 app = FastAPI(
     title="Spectra",
     lifespan=lifespan,
-    dependencies=[Depends(security.require_api_key)],
-    docs_url=None if security.API_KEY else "/docs",
-    redoc_url=None if security.API_KEY else "/redoc",
-    openapi_url=None if security.API_KEY else "/openapi.json",
+    docs_url=None if _auth_configured else "/docs",
+    redoc_url=None if _auth_configured else "/redoc",
+    openapi_url=None if _auth_configured else "/openapi.json",
 )
 
 
@@ -122,7 +122,7 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/assess", dependencies=[Depends(security.rate_limit)])
+@app.post("/assess", dependencies=[Depends(security.require_internal_key), Depends(security.rate_limit)])
 async def assess_track(file: UploadFile = File(...)) -> dict:
     """Synchronous pre-save assessment: upload a local audio file, get analysis
     back in the response (including is_music). Writes nothing to the database —
@@ -151,7 +151,7 @@ async def assess_track(file: UploadFile = File(...)) -> dict:
             os.remove(tmp_path)
 
 
-@app.post("/spectral-map", dependencies=[Depends(security.rate_limit)])
+@app.post("/spectral-map", dependencies=[Depends(security.require_internal_key), Depends(security.rate_limit)])
 async def spectral_map_track(
     file: UploadFile = File(...),
     segment: str = Form(...),
@@ -343,7 +343,7 @@ def _plan_for(path_a: str, path_c: str, analysis: MixAnalysis | None, plan: dict
     return _absolutize_plan(plan_mix(map_a, map_c, grid), map_a["segment_offset_sec"])
 
 
-@app.post("/mix/analyze", dependencies=[Depends(security.rate_limit), Depends(security.mix_slot)])
+@app.post("/mix/analyze", dependencies=[Depends(security.require_mix_access), Depends(security.rate_limit), Depends(security.mix_slot)])
 async def analyze_mix(
     file_a: UploadFile = File(..., description="outgoing track (tail is analyzed)"),
     file_c: UploadFile = File(..., description="incoming track (head is analyzed)"),
@@ -383,7 +383,7 @@ async def analyze_mix(
             **report, "suggested_plan": plan}
 
 
-@app.post("/mix", dependencies=[Depends(security.rate_limit), Depends(security.mix_slot)])
+@app.post("/mix", dependencies=[Depends(security.require_mix_access), Depends(security.rate_limit), Depends(security.mix_slot)])
 async def mix_tracks(
     file_a: UploadFile | None = File(None, description="outgoing track (tail is analyzed unless files_b is given); omit with analysis_id"),
     file_c: UploadFile | None = File(None, description="incoming track (head is analyzed unless files_b is given); omit with analysis_id"),
@@ -510,7 +510,7 @@ async def _run_mix_job(job: MixJob, job_id: str, tmp_a: str, tmp_c: str, tmp_b: 
         _cleanup(*owned)
 
 
-@app.post("/mix/jobs", status_code=202, dependencies=[Depends(security.rate_limit)])
+@app.post("/mix/jobs", status_code=202, dependencies=[Depends(security.require_mix_access), Depends(security.rate_limit)])
 async def create_mix_job(
     file_a: UploadFile | None = File(None, description="outgoing track (tail is analyzed); omit with analysis_id"),
     file_c: UploadFile | None = File(None, description="incoming track (head is analyzed unless files_b is given); omit with analysis_id"),
@@ -564,7 +564,7 @@ async def create_mix_job(
     return {"job_id": job_id}
 
 
-@app.get("/mix/jobs/{job_id}/events")
+@app.get("/mix/jobs/{job_id}/events", dependencies=[Depends(security.require_mix_access)])
 async def mix_job_events(job_id: str) -> StreamingResponse:
     job = _mix_jobs.get(job_id)
     if job is None:
@@ -598,7 +598,7 @@ async def mix_job_events(job_id: str) -> StreamingResponse:
     )
 
 
-@app.get("/mix/jobs/{job_id}/result")
+@app.get("/mix/jobs/{job_id}/result", dependencies=[Depends(security.require_mix_access)])
 async def mix_job_result(job_id: str) -> FileResponse:
     job = _mix_jobs.get(job_id)
     if job is None:
@@ -658,7 +658,7 @@ def _analyze_and_store(sound_fragment_id: str, path: str | None) -> None:
             os.remove(local_path)
 
 
-@app.post("/analyze", status_code=202)
+@app.post("/analyze", status_code=202, dependencies=[Depends(security.require_internal_key)])
 def analyze_track(request: AnalyzeRequest, background_tasks: BackgroundTasks) -> dict:
     """Accept a file reference over REST, acknowledge immediately (202), and run
     analysis in the background. On success the result is written to the
